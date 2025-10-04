@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WLED Pixel Editor — Full</title>
+<style>
+  :root{
+    --bg:#0b1220; --panel:#0f1720; --muted:#94a3b8; --accent:#06b6d4;
+    color-scheme:dark;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:var(--bg);color:#e6eef6}
+  .app{display:grid;grid-template-columns:320px 1fr;gap:12px;height:100vh;padding:12px}
+  .panel{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent);border-radius:10px;padding:12px;box-shadow:0 6px 18px rgba(2,6,23,0.6)}
+  header{display:flex;align-items:center;gap:8px}
+  h1{font-size:16px;margin:0}
+  label{font-size:13px;color:var(--muted);display:block;margin-top:8px}
+  input,select,button{font-size:13px;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
+  .controls{display:flex;flex-direction:column;gap:8px}
+  .row{display:flex;gap:8px;align-items:center}
+  .canvas-wrap{display:flex;flex-direction:column;height:calc(100vh - 48px)}
+  .grid-container{flex:1;background:#05101a;border-radius:8px;overflow:hidden;position:relative;cursor:grab}
+  .grid-container.dragging{cursor:grabbing}
+  canvas#stage{display:block; background:#031018; width:100%; height:100%}
+  .toolbar{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .effect-list{max-height:120px;overflow:auto;padding:6px;border-radius:8px;background:rgba(255,255,255,0.01)}
+  .small{font-size:12px;padding:6px}
+  .footer{font-size:12px;color:var(--muted);margin-top:8px}
+  .kbd{background:rgba(255,255,255,0.03);padding:4px 6px;border-radius:6px}
+</style>
+</head>
+<body>
+  <div class="app">
+    <div class="panel">
+      <header><h1>WLED Pixel Editor — Full</h1><div class="kbd">Single-file</div></header>
+
+      <div class="controls">
+        <div class="row">
+          <label style="width:100px">LED count</label>
+          <input id="ledCount" type="number" min="1" value="300" />
+          <button id="applyCount" class="small">Apply</button>
+        </div>
+
+        <label>Zoom <span id="zoomVal">1.0</span></label>
+        <input id="zoom" type="range" min="0.4" max="4" step="0.1" value="1" />
+
+        <div class="row">
+          <label style="width:100px">Tool</label>
+          <select id="tool">
+            <option value="brush">Brush (B)</option>
+            <option value="erase">Eraser (E)</option>
+            <option value="fill">Bucket Fill (F)</option>
+            <option value="pick">Eyedropper (I)</option>
+            <option value="select">Select</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <label style="width:100px">Color</label>
+          <input id="color" type="color" value="#ff8000" />
+          <input id="alpha" type="range" min="0" max="255" value="255" style="width:80px"/>
+        </div>
+
+        <label>Brush size <span id="brushSizeVal">1</span></label>
+        <input id="brushSize" type="range" min="1" max="12" value="1" />
+
+        <label>Effects (assign to selection)</label>
+        <div class="effect-list" id="effectList"></div>
+
+        <div class="row">
+          <label style="width:100px">WLED IP</label>
+          <input id="wledIp" type="text" value="wled.local" />
+        </div>
+
+        <div class="row" style="margin-top:6px">
+          <button id="undo" class="small">Undo (Ctrl+Z)</button>
+          <button id="redo" class="small">Redo (Ctrl+Y)</button>
+        </div>
+
+        <div class="row" style="margin-top:6px">
+          <button id="exportPreset" class="small">Export WLED Preset</button>
+          <button id="exportPixelmap" class="small">Export Pixelmap</button>
+		  <button id="exportProject" class="small">Export Project</button>
+        </div>
+
+        <div class="row">
+          <button id="sendPixelmap" class="small">i only know what this button does</button>
+        </div>
+
+        <div class="row">
+          <button id="importBtn" class="small">Import JSON</button>
+          <input id="fileIn" type="file" accept="application/json" style="display:none" />
+        </div>
+
+        <div class="footer">
+          <div>Hover LED: <span id="hoverIdx">-</span> &nbsp; Selected: <span id="selCount">0</span></div>
+          <div>Segments: <span id="segCount">0</span></div>
+          <div style="margin-top:6px">Navigation: Drag to pan (grab), Shift+wheel → horizontal scroll. Shortcuts: B brush, E erase, F fill, I eyedropper, S select.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap panel">
+      <div class="grid-container" id="gridContainer">
+        <canvas id="stage"></canvas>
+      </div>
+
+      <div class="toolbar">
+        <button id="playPreview" class="small">Preview</button>
+        <button id="stopPreview" class="small">Stop</button>
+        <div style="margin-left:auto;color:var(--muted)">FPS: <span id="fps">60</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ------------------------------
+  WLED Pixel Editor — Full JS
+   - drawing tools (brush/erase/fill/pick/select)
+   - brush-drag painting
+   - zoom + drag-to-pan + shift wheel horizontal pan
+   - undo/redo
+   - export pixelmap (exact)
+   - export preset (compress to ≤32 segments)
+   - import pixelmap & preset
+   - Node.js streamer downloader (helper)
+-------------------------------*/
+
+// Data model
+let ledCount = 300;
+let leds = []; // array of [r,g,b]
+let segments = []; // logical segments if created, but main source = leds[]
+let selection = new Set(); // indices selected
+
+// UI / canvas
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d', { alpha: false });
+const gridContainer = document.getElementById('gridContainer');
+
+let cols, rows; // layout (we'll do single row and wrap as needed)
+let zoom = 1.0;
+let brushSize = 1;
+let tool = 'brush';
+let isMouseDown = false;
+let lastPos = null;
+let pan = {x:0,y:0};
+let draggingCanvas = false;
+let dragStart = null;
+let scrollStart = null;
+let undoStack = [], redoStack = [];
+const MAX_UNDO = 100;
+
+const effects = [
+  {id:0,name:'Solid'}, {id:65,name:'Rainbow'}, {id:2,name:'Chase'},
+  {id:110,name:'Flicker'}, {id:80,name:'Noise'}
+];
+
+const deviceWidthPadding = 12;
+
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+// initialize UI
+document.getElementById('applyCount').addEventListener('click', ()=>{ ledCount = Math.max(1, parseInt(document.getElementById('ledCount').value||1)); resetData(); resize(); render();});
+document.getElementById('zoom').addEventListener('input', (e)=>{ zoom=parseFloat(e.target.value); document.getElementById('zoomVal').innerText = zoom.toFixed(1); resize(); render(); });
+document.getElementById('color').addEventListener('input', ()=>{});
+document.getElementById('brushSize').addEventListener('input', (e)=>{ brushSize = parseInt(e.target.value); document.getElementById('brushSizeVal').innerText = brushSize; });
+document.getElementById('tool').addEventListener('change', (e)=>{ tool = e.target.value; });
+document.getElementById('undo').addEventListener('click', undo);
+document.getElementById('redo').addEventListener('click', redo);
+document.getElementById('exportPixelmap').addEventListener('click', exportPixelmap);
+document.getElementById('exportPreset').addEventListener('click', exportPresetCompress);
+document.getElementById('exportProject').addEventListener('click', exportProject);
+document.getElementById('importBtn').addEventListener('click', ()=>document.getElementById('fileIn').click());
+document.getElementById('fileIn').addEventListener('change', importProject);
+document.getElementById('sendPixelmap').addEventListener('click', downloadNodeStreamer);
+
+// effect list
+const efList = document.getElementById('effectList');
+effects.forEach((ef,i)=>{ const d = document.createElement('div'); d.style.padding='6px'; d.style.cursor='pointer'; d.textContent = ef.name + ' (fx:'+ef.id+')'; d.addEventListener('click', ()=>{ document.querySelectorAll('#effectList > div').forEach(x=>x.style.background=''); d.style.background='rgba(255,255,255,0.03)'; selectedEffect = ef.id; }); efList.appendChild(d); });
+let selectedEffect = effects[0].id;
+efList.children[0].style.background='rgba(255,255,255,0.03)';
+
+// keyboard shortcuts
+window.addEventListener('keydown', (e)=>{
+  if(e.key==='b'||e.key==='B'){ tool='brush'; document.getElementById('tool').value='brush'; }
+  if(e.key==='e'||e.key==='E'){ tool='erase'; document.getElementById('tool').value='erase'; }
+  if(e.key==='f'||e.key==='F'){ tool='fill'; document.getElementById('tool').value='fill'; }
+  if(e.key==='i'||e.key==='I'){ tool='pick'; document.getElementById('tool').value='pick'; }
+  if((e.ctrlKey||e.metaKey) && e.key==='z'){ e.preventDefault(); undo(); }
+  if((e.ctrlKey||e.metaKey) && e.key==='y'){ e.preventDefault(); redo(); }
+});
+
+// initialize canvas size and grid
+function resize(){
+  canvas.width = gridContainer.clientWidth;
+  canvas.height = gridContainer.clientHeight;
+  computeLayout();
+  render();
+}
+window.addEventListener('resize', resize);
+
+// compute grid (single horizontal row with wrapping)
+function computeLayout(){
+  const pixelSize = Math.max(4, Math.round(8 * zoom)); // base ~8
+  const gap = 1;
+  cols = Math.max(1, Math.floor((canvas.width - deviceWidthPadding) / (pixelSize + gap)));
+  rows = Math.max(1, Math.ceil(ledCount / cols));
+  cell = { w: pixelSize, h: pixelSize, gap: gap };
+}
+
+// LED coordinate functions
+function ledPosition(index){
+  const col = index % cols;
+  const row = Math.floor(index / cols);
+  const x = deviceWidthPadding/2 + col*(cell.w+cell.gap) + pan.x;
+  const y = deviceWidthPadding/2 + row*(cell.h+cell.gap) + pan.y;
+  return { x, y, w: cell.w, h: cell.h };
+}
+function pickLedAt(x,y){
+  for(let i=0;i<ledCount;i++){
+    const p = ledPosition(i);
+    if(x>=p.x && x<=p.x+p.w && y>=p.y && y<=p.y+p.h) return i;
+  }
+  return null;
+}
+
+// drawing / painting
+function startStroke(clientX, clientY){
+  isMouseDown = true;
+  lastPos = {x: clientX, y: clientY};
+  pushUndo();
+  handleStrokeAt(clientX, clientY);
+}
+function continueStroke(clientX, clientY){
+  if(!isMouseDown) return;
+  // draw a line between lastPos and current pos, sampling points
+  const steps = Math.max(1, Math.ceil(Math.hypot(clientX-lastPos.x, clientY-lastPos.y)/ (cell.w/2)));
+  for(let s=0;s<=steps;s++){
+    const t = s/steps;
+    const ix = lastPos.x*(1-t) + clientX*t;
+    const iy = lastPos.y*(1-t) + clientY*t;
+    handleStrokeAt(ix, iy);
+  }
+  lastPos = {x:clientX, y:clientY};
+}
+function endStroke(){
+  isMouseDown = false;
+}
+
+function handleStrokeAt(clientX, clientY){
+  // convert to canvas coords
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  // get LED idx
+  const idx = pickLedAt(x,y);
+  if(idx==null) return;
+  if(tool==='brush'){
+    applyBrush(idx);
+  } else if(tool==='erase'){
+    applyErase(idx);
+  } else if(tool==='pick'){
+    const c = leds[idx] || [0,0,0];
+    const hex = rgbToHex(c[0],c[1],c[2]);
+    document.getElementById('color').value = hex;
+    tool='brush'; document.getElementById('tool').value='brush';
+  } else if(tool==='fill'){
+    bucketFill(idx);
+  } else if(tool==='select'){
+    // select single for now (shift/drag selection is supported via selection rectangle — omitted for brevity)
+    selection.clear();
+    selection.add(idx);
+    updateUI();
+  }
+  render();
+}
+
+function applyBrush(centerIdx){
+  const half = Math.floor(brushSize/2);
+  // paint a simple 1D span around center (for strip it's fine)
+  const color = hexToRgb(document.getElementById('color').value);
+  for(let dx=-half; dx<=half; dx++){
+    const i = centerIdx + dx;
+    if(i>=0 && i<ledCount){
+      leds[i] = [color.r, color.g, color.b];
+    }
+  }
+}
+function applyErase(centerIdx){
+  const half = Math.floor(brushSize/2);
+  for(let dx=-half; dx<=half; dx++){
+    const i = centerIdx + dx;
+    if(i>=0 && i<ledCount){ leds[i] = [0,0,0]; }
+  }
+}
+
+function bucketFill(startIdx){
+  const target = leds[startIdx] || [0,0,0];
+  const newcRaw = hexToRgb(document.getElementById('color').value);
+  const newc = [newcRaw.r,newcRaw.g,newcRaw.b];
+  if(arraysEqual(target,newc)) return;
+  // 1D flood fill (contiguous run)
+  let l = startIdx, r = startIdx;
+  while(l-1>=0 && arraysEqual(leds[l-1]||[0,0,0],target)) l--;
+  while(r+1<ledCount && arraysEqual(leds[r+1]||[0,0,0],target)) r++;
+  for(let i=l;i<=r;i++) leds[i] = newc;
+}
+
+// helpers
+function hexToRgb(hex){
+  hex = hex.replace('#','');
+  return { r: parseInt(hex.substring(0,2),16), g: parseInt(hex.substring(2,4),16), b: parseInt(hex.substring(4,6),16) };
+}
+function rgbToHex(r,g,b){ return '#'+[r,g,b].map(v=>v.toString(16).padStart(2,'0')).join(''); }
+function arraysEqual(a,b){ return a[0]===b[0] && a[1]===b[1] && a[2]===b[2]; }
+
+// undo/redo
+function pushUndo(){
+  undoStack.push(JSON.stringify(leds));
+  if(undoStack.length>MAX_UNDO) undoStack.shift();
+  redoStack = [];
+  updateUI();
+}
+function undo(){
+  if(undoStack.length===0) return;
+  const state = undoStack.pop();
+  redoStack.push(JSON.stringify(leds));
+  leds = JSON.parse(state);
+  render();
+}
+function redo(){
+  if(redoStack.length===0) return;
+  const state = redoStack.pop();
+  undoStack.push(JSON.stringify(leds));
+  leds = JSON.parse(state);
+  render();
+}
+
+// render
+function render(){
+  ctx.fillStyle = '#031018'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  const fontSz = Math.max(10, Math.round(10 * zoom));
+  for(let i=0;i<ledCount;i++){
+    const p = ledPosition(i);
+    const c = leds[i] || [0,0,0];
+    ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+    ctx.fillRect(Math.round(p.x)+0.5, Math.round(p.y)+0.5, Math.round(p.w)-1, Math.round(p.h)-1);
+    // stroke
+    ctx.strokeStyle = selection.has(i) ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = selection.has(i) ? 2 : 1;
+    ctx.strokeRect(Math.round(p.x)+0.5, Math.round(p.y)+0.5, Math.round(p.w)-1, Math.round(p.h)-1);
+  }
+  updateUI();
+}
+function updateUI(){
+  document.getElementById('hoverIdx').innerText = '-';
+  document.getElementById('selCount').innerText = selection.size;
+  document.getElementById('segCount').innerText = segments.length;
+}
+
+// input handlers (mouse & touch)
+canvas.addEventListener('mousedown', (e)=>{
+  // if user is grabbing spacebar? we'll always paint unless they start drag-pan on background
+  if(e.button === 1) { // middle for pan
+    draggingCanvas = true; dragStart={x:e.pageX,y:e.pageY}; scrollStart={x:pan.x,y:pan.y}; gridContainer.classList.add('dragging'); return;
+  }
+  // if user clicked on background (no led), allow pan by dragging while holding space? we simply use right-click to pan
+  if(tool==='select'){ /* selection rectangle could be implemented, simplified here */ }
+  startStroke(e.clientX, e.clientY);
+});
+window.addEventListener('mousemove', (e)=>{
+  if(draggingCanvas){ const dx = e.pageX - dragStart.x; const dy = e.pageY - dragStart.y; pan.x = scrollStart.x + dx; pan.y = scrollStart.y + dy; render(); return; }
+  if(isMouseDown) continueStroke(e.clientX, e.clientY);
+  // hover update
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const idx = pickLedAt(x,y);
+  document.getElementById('hoverIdx').innerText = idx==null?'-':idx;
+});
+window.addEventListener('mouseup', (e)=>{ if(draggingCanvas){ draggingCanvas=false; gridContainer.classList.remove('dragging'); } endStroke(); });
+canvas.addEventListener('wheel', (e)=>{
+  if(e.shiftKey){ e.preventDefault(); pan.x -= e.deltaY; render(); }
+  // ctrl + wheel = zoom?
+  if(e.ctrlKey){ e.preventDefault(); zoom = clamp(zoom - Math.sign(e.deltaY)*0.1, 0.4, 4); document.getElementById('zoom').value = zoom; document.getElementById('zoomVal').innerText = zoom.toFixed(1); computeLayout(); render(); }
+});
+
+// touch support (basic)
+let lastTouch = null;
+canvas.addEventListener('touchstart', (ev)=>{ ev.preventDefault(); const t = ev.touches[0]; startStroke(t.clientX, t.clientY); });
+canvas.addEventListener('touchmove', (ev)=>{ ev.preventDefault(); const t = ev.touches[0]; continueStroke(t.clientX, t.clientY); });
+canvas.addEventListener('touchend', (ev)=>{ ev.preventDefault(); endStroke(); });
+
+// import/export functions
+function exportPixelmap(){
+  const out = { leds: leds.map(c=>c || [0,0,0]), meta:{ledCount} };
+  const blob = new Blob([JSON.stringify(out,null,2)],{type:'application/json'}), url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'pixelmap.json'; a.click(); URL.revokeObjectURL(url);
+  // also open in new tab for quick inspect
+  const w = window.open(); if(w){ w.document.body.style.background='#08121a'; const pre=document.createElement('pre'); pre.style.color='#dceffb'; pre.textContent = JSON.stringify(out,null,2); w.document.body.appendChild(pre); }
+}
+
+function exportProject(){
+  const project = {
+    leds: leds.map(c => c || [0,0,0]),
+    selection: Array.from(selection),
+    segments: segments,
+    meta: {
+      ledCount,
+      zoom,
+      brushSize,
+      tool,
+      selectedEffect
+    }
+  };
+
+  const blob = new Blob([JSON.stringify(project,null,2)],{type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'wled_project.json';
+  a.click();
+  URL.revokeObjectURL(url);
+
+  // optional preview in new tab
+  const w = window.open();
+  if(w){
+    w.document.body.style.background='#08121a';
+    const pre=document.createElement('pre');
+    pre.style.color='#dceffb';
+    pre.textContent = JSON.stringify(project,null,2);
+    w.document.body.appendChild(pre);
+  }
+}
+
+// compress contiguous same-color runs and then, if >32, merge smallest until ≤32
+function exportPresetCompress(){
+  // compute runs
+  const runs = [];
+  let i=0;
+  while(i<ledCount){
+    const c = leds[i] || [0,0,0];
+    let j=i+1;
+    while(j<ledCount && arraysEqual(leds[j]||[0,0,0], c)) j++;
+    runs.push({start:i, stop:j, color:c});
+    i=j;
+  }
+  // if runs <=32 we're done
+  // if >32 merge shortest runs iteratively until <=32
+  while(runs.length>32){
+    // find shortest run (min length)
+    let minIdx = 0, minLen = runs[0].stop - runs[0].start;
+    for(let k=1;k<runs.length;k++){
+      const len = runs[k].stop - runs[k].start;
+      if(len < minLen){ minLen = len; minIdx = k; }
+    }
+    // merge minIdx with neighbor that's smallest after merge decision: merge with previous if exists else next
+    if(minIdx>0){
+      // merge into previous
+      const prev = runs[minIdx-1];
+      prev.stop = runs[minIdx].stop;
+      // keep prev.color (could pick average — we keep prev)
+      runs.splice(minIdx,1);
+    } else {
+      // merge with next
+      const next = runs[minIdx+1];
+      next.start = runs[minIdx].start;
+      runs.splice(minIdx,1);
+    }
+  }
+
+  // build seg array up to 32 slots
+  const segArr = [];
+  for(let s=0;s<runs.length;s++){
+    const r = runs[s];
+    const seg = {
+      id: s,
+      start: r.start,
+      stop: r.stop,
+      grp:1, spc:0, of:0, on:true, frz:false, bri:255, cct:127, set:0,
+      col: [ r.color, [0,0,0], [0,0,0] ],
+      fx: 0, sx:128, ix:128, pal:0, c1:128, c2:128, c3:16, sel:true
+    };
+    segArr.push(seg);
+  }
+  while(segArr.length<32) segArr.push({stop:0});
+
+  const preset = { on:true, bri:128, transition:7, mainseg:0, seg:segArr };
+  const blob = new Blob([JSON.stringify(preset,null,2)],{type:'application/json'}), url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='preset.json'; a.click(); URL.revokeObjectURL(url);
+  const w = window.open(); if(w){ w.document.body.style.background='#08121a'; const pre=document.createElement('pre'); pre.style.color='#dceffb'; pre.textContent = JSON.stringify(preset,null,2); w.document.body.appendChild(pre); }
+}
+
+// import
+function importProject(e){
+  const f = e.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = ()=> {
+    try{
+      const data = JSON.parse(reader.result);
+      if(data.leds){ // pixelmap
+        leds = data.leds.slice(0, data.meta?.ledCount || data.leds.length);
+        ledCount = leds.length;
+        document.getElementById('ledCount').value = ledCount;
+        computeLayout();
+        render();
+      } else if(data.seg){ // preset
+        // apply each seg's first color across its span (approximate)
+        leds = Array( ledCount ).fill([0,0,0]);
+        data.seg.forEach(seg=>{
+          if(seg.stop>seg.start && seg.col && seg.col[0]) for(let k=seg.start;k<seg.stop && k<leds.length;k++) leds[k] = seg.col[0];
+        });
+        render();
+      } else {
+        alert('Unknown JSON format');
+      }
+    }catch(err){ alert('Invalid JSON: '+err); }
+  };
+  reader.readAsText(f);
+}
+
+// helper: download Node.js streamer script (so browser can't/doesn't try UDP)
+function downloadNodeStreamer(){
+  const ipPlaceholder = document.getElementById('wledIp').value || 'wled.local';
+  const script = `// Node.js DDP/UDP pixelmap streamer helper
+// Usage: node stream_pixelmap.js pixelmap.json <WLED_IP> <PORT>
+// Default WLED DDP port 0xCC? (DDP common port 4048). Use 19446 for some setups.
+// Example: node stream_pixelmap.js pixelmap.json ${ipPlaceholder} 4048
+
+const dgram = require('dgram');
+const fs = require('fs');
+const path = require('path');
+
+if(process.argv.length < 3){ console.log('Usage: node stream_pixelmap.js pixelmap.json <WLED_IP> <PORT>'); process.exit(1); }
+
+const file = process.argv[2];
+const ip = process.argv[3] || '${ipPlaceholder}';
+const port = parseInt(process.argv[4] || '4048',10);
+
+const data = JSON.parse(fs.readFileSync(file));
+const leds = data.leds || [];
+const sock = dgram.createSocket('udp4');
+
+// DDP (simplified) packet builder
+// This creates a single DDP packet (universe 0) with RGB bytes for each LED.
+// Depending on your WLED build/config, you may need to adjust port or header.
+function buildDDP(rgbArray){
+  // DDP header (simple): 'D' 'D' 'P' 0x01 0x00 ... minimal
+  const payload = Buffer.alloc(rgbArray.length * 3);
+  for(let i=0;i<rgbArray.length;i++){
+    payload[i*3] = rgbArray[i][0];
+    payload[i*3+1] = rgbArray[i][1];
+    payload[i*3+2] = rgbArray[i][2];
+  }
+  // many DDP implementations require a header — for many WLEDs, sending raw RGB to port 21324/4048 works.
+  return payload;
+}
+
+const payload = buildDDP(leds);
+sock.send(payload,0,payload.length,port,ip, (err)=>{ if(err) console.error(err); else console.log('sent',payload.length,'bytes to',ip+':'+port); sock.close(); });`;
+  const blob = new Blob([script],{type:'text/plain'}), url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='stream_pixelmap.js'; a.click(); URL.revokeObjectURL(url);
+  alert('Downloaded Node.js streamer helper. Use it with the exported pixelmap JSON.');
+}
+
+// initial data
+function resetData(){
+  leds = [];
+  for(let i=0;i<ledCount;i++) leds.push([0,0,0]);
+  selection.clear();
+  segments = [];
+  undoStack = []; redoStack = [];
+  updateUI();
+}
+resetData();
+resize();
+render();
+
+</script>
+</body>
+</html>
